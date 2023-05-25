@@ -4,10 +4,12 @@ import (
 	"context"
 	dpfm_api_input_reader "data-platform-api-language-exconf-rmq-kube/DPFM_API_Input_Reader"
 	dpfm_api_output_formatter "data-platform-api-language-exconf-rmq-kube/DPFM_API_Output_Formatter"
-	"data-platform-api-language-exconf-rmq-kube/database"
-	"sync"
+	"encoding/json"
 
 	"github.com/latonaio/golang-logging-library-for-data-platform/logger"
+	database "github.com/latonaio/golang-mysql-network-connector"
+	rabbitmq "github.com/latonaio/rabbitmq-golang-client-for-data-platform"
+	"golang.org/x/xerrors"
 )
 
 type ExistenceConf struct {
@@ -24,61 +26,56 @@ func NewExistenceConf(ctx context.Context, db *database.Mysql, l *logger.Logger)
 	}
 }
 
-func (e *ExistenceConf) Conf(input *dpfm_api_input_reader.SDC) *dpfm_api_output_formatter.Language {
-	language := *input.Language.Language
-	notKeyExistence := make([]string, 0, 1)
-	KeyExistence := make([]string, 0, 1)
+func (e *ExistenceConf) Conf(msg rabbitmq.RabbitmqMessage) interface{} {
+	var ret interface{}
+	ret = map[string]interface{}{
+		"ExistenceConf": false,
+	}
+	input := make(map[string]interface{})
+	err := json.Unmarshal(msg.Raw(), &input)
+	if err != nil {
+		return ret
+	}
 
-	existData := &dpfm_api_output_formatter.Language{
-		Language:      language,
+	_, ok := input["Language"]
+	if ok {
+		input := &dpfm_api_input_reader.SDC{}
+		err = json.Unmarshal(msg.Raw(), input)
+		ret = e.confLanguage(input)
+		goto endProcess
+	}
+
+	err = xerrors.Errorf("can not get exconf check target")
+endProcess:
+	if err != nil {
+		e.l.Error(err)
+	}
+	return ret
+}
+
+func (e *ExistenceConf) confLanguage(input *dpfm_api_input_reader.SDC) *dpfm_api_output_formatter.Language {
+	exconf := dpfm_api_output_formatter.Language{
+		ExistenceConf: false,
+	}
+	if input.Language.Language == nil {
+		return &exconf
+	}
+	exconf = dpfm_api_output_formatter.Language{
+		Language:      *input.Language.Language,
 		ExistenceConf: false,
 	}
 
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if !e.confLanguage(language) {
-			notKeyExistence = append(notKeyExistence, language)
-			return
-		}
-		KeyExistence = append(KeyExistence, language)
-	}()
-
-	wg.Wait()
-
-	if len(KeyExistence) == 0 {
-		return existData
-	}
-	if len(notKeyExistence) > 0 {
-		return existData
-	}
-
-	existData.ExistenceConf = true
-	return existData
-}
-
-func (e *ExistenceConf) confLanguage(val string) bool {
 	rows, err := e.db.Query(
 		`SELECT Language 
 		FROM DataPlatformMastersAndTransactionsMysqlKube.data_platform_language_language_data 
-		WHERE Language = ?;`, val,
+		WHERE Language = ?;`, exconf.Language,
 	)
 	if err != nil {
 		e.l.Error(err)
-		return false
+		return &exconf
 	}
+	defer rows.Close()
 
-	for rows.Next() {
-		var language string
-		err := rows.Scan(&language)
-		if err != nil {
-			e.l.Error(err)
-			continue
-		}
-		if language == val {
-			return true
-		}
-	}
-	return false
+	exconf.ExistenceConf = rows.Next()
+	return &exconf
 }
